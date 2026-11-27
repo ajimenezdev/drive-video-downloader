@@ -9,7 +9,9 @@
 // installed/enabled, or navigation did not trigger the content script.
 //
 // content.js is injected first, so it is listening before hook.js starts
-// forwarding captures.
+// forwarding captures. The two injections are chained (not concurrent):
+// hook.js only runs after the content.js injection resolves, so the order
+// is guaranteed even in this recovery path (review follow-up on PR #1).
 var FILE_VIEW = /^https:\/\/drive\.google\.com\/file\/d\/[^/]+\//;
 
 chrome.tabs.onUpdated.addListener(function (tabId, changeInfo, tab) {
@@ -22,15 +24,14 @@ chrome.tabs.onUpdated.addListener(function (tabId, changeInfo, tab) {
   chrome.scripting.executeScript({
     target: { tabId: tabId },
     files: ['content.js']
+  }).then(function () {
+    return chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      files: ['hook.js'],
+      world: 'MAIN'
+    });
   }).catch(function () {
     // The tab may have been closed, or the document may not be ready yet
     // (on 'loading'); the 'complete' attempt covers it.
-  });
-  chrome.scripting.executeScript({
-    target: { tabId: tabId },
-    files: ['hook.js'],
-    world: 'MAIN'
-  }).catch(function () {
-    // Same as above.
   });
 });
