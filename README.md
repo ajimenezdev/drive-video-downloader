@@ -42,7 +42,11 @@ one the player makes.
   It validates every message (same window and origin,
   expected shape, well-formed file ID) and the click re-checks the file ID
   against the address bar, so a click racing a navigation cannot open a
-  stale URL.
+  stale URL. The single place that opens a URL only accepts `https:` URLs
+  on `googlevideo.com` or one of its subdomains (exact host or a proper
+  `.googlevideo.com` suffix — never substring matching, so lookalikes like
+  `googlevideo.com.evil.com` are rejected) and opens them with
+  `noopener,noreferrer`.
 - When a response arrives from the playback API (URL containing
   `/drive/media/` and `playback`), it extracts the progressive link: itag 18
   (360p with audio), else 22 (720p), else the first progressive transcode,
@@ -50,6 +54,10 @@ one the player makes.
   button; clicking it (a user gesture) opens the link in a new tab.
 - If the response carries no link, the button downloads the response as
   `response.json` instead, so you can inspect it.
+- If the player's request fails, the button area shows a short error state
+  instead of staying silent: the HTTP status (`Couldn't detect the video
+  (403)`), or an unreadable response, an interrupted request, a timeout,
+  or a network failure — with a note suggesting a reload.
 - It sends nothing anywhere: everything stays between your browser and
   Google. No account data, no analytics, no third-party requests.
 
@@ -90,12 +98,14 @@ extension keeps working.
 - `background.js` — service worker: re-injects the hook and the content
   script when the page loads.
 - `hook.js` — the capture hook (MAIN world): observes the player's
-  requests and forwards the progressive link with its file ID, and
-  notifies the content script of SPA navigation.
+  requests and forwards the progressive link with its file ID, forwards
+  capture failures as structured errors, and notifies the content script
+  of SPA navigation.
 - `content.js` — the content script (isolated world): per-video state,
   navigation handling (hook notification, `popstate`, 1 s poller
-  fallback), message validation, the button, and the single place that
-  opens a captured URL.
+  fallback), message validation, the button and its error states, and the
+  single place that opens a captured URL (googlevideo allowlist,
+  `noopener`/`noreferrer`).
 - `test/` — Node tests with a stubbed browser (separate MAIN and isolated
   worlds, bridged only by `postMessage`) and an anonymized playback
   fixture. Run with `node test/test-extension.js`.

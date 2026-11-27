@@ -20,6 +20,11 @@
 //   its response is processed. The address bar is never read when the
 //   response arrives: by then the viewer may have navigated to another
 //   video and the capture would be misattributed to it.
+// - When a request fails, it forwards a structured error to the content
+//   script ('dvd-capture-error' with the file ID and a short code: the
+//   HTTP status, 'invalid-json', 'aborted', 'timeout' or 'network'),
+//   so the failure is visible instead of silent. A successful capture
+//   is still forwarded as before.
 // - It also wraps window.history.pushState/replaceState (MAIN world only:
 //   the page's router calls MAIN-world history, so a wrapper anywhere
 //   else would not see its calls) and notifies the content script of
@@ -120,6 +125,25 @@
     }, window.location.origin);
   }
 
+  // Forward a capture error to the content script, so a failed request is
+  // visible instead of silent. The code is a short string: the HTTP status
+  // ('403', '404', '500', ...), 'invalid-json' when the response body is
+  // not parseable JSON, 'aborted' when the request was aborted, 'timeout'
+  // when it timed out, or 'network' for any other failure. The fileId was
+  // captured when the request started; an error without one cannot be
+  // attributed to a video, so it is dropped.
+  function postCaptureError(fileId, code) {
+    if (!fileId) {
+      return;
+    }
+    window.postMessage({
+      source: MESSAGE_SOURCE,
+      type: 'dvd-capture-error',
+      fileId: fileId,
+      code: code
+    }, window.location.origin);
+  }
+
   function handleResponse(fileId, json, jsonText) {
     var video = null;
     try {
@@ -193,11 +217,26 @@
         var fileId = fileIdAtRequestStart(url);
         p.then(function (resp) {
           try {
+            // HTTP error status (403/404/500, ...): report it and do not
+            // try to parse the body as a playback response. Checked on
+            // the status number when present, falling back to resp.ok.
+            var httpStatus = resp && typeof resp.status === 'number' ? resp.status : null;
+            if (httpStatus !== null ? httpStatus >= 400 : (resp && resp.ok === false)) {
+              postCaptureError(fileId, httpStatus !== null ? String(httpStatus) : 'network');
+              return;
+            }
             resp.clone().json().then(function (j) {
               handleResponse(fileId, j, null);
-            }).catch(function () {});
+            }).catch(function () {
+              // The body is not parseable JSON.
+              postCaptureError(fileId, 'invalid-json');
+            });
           } catch (e) {}
-        }).catch(function () {});
+        }).catch(function (err) {
+          // The request itself failed: aborted (AbortController) or any
+          // other failure (network, ...).
+          postCaptureError(fileId, err && err.name === 'AbortError' ? 'aborted' : 'network');
+        });
       }
       return p;
     };
@@ -220,15 +259,40 @@
     if (xhr.__driveVideoDownloaderUrl && isPlaybackUrl(xhr.__driveVideoDownloaderUrl)) {
       xhr.addEventListener('load', function () {
         try {
+          // HTTP error status: the load event still fires for 4xx/5xx.
+          if (typeof xhr.status === 'number' && xhr.status >= 400) {
+            postCaptureError(xhr.__driveVideoDownloaderFileId, String(xhr.status));
+            return;
+          }
           if (xhr.responseType === 'json' && xhr.response) {
             handleResponse(xhr.__driveVideoDownloaderFileId, xhr.response, JSON.stringify(xhr.response));
             return;
           }
           var text = xhr.responseText;
           if (text) {
-            handleResponse(xhr.__driveVideoDownloaderFileId, JSON.parse(text), text);
+            var parsed;
+            try {
+              parsed = JSON.parse(text);
+            } catch (e) {
+              // The body is not parseable JSON.
+              postCaptureError(xhr.__driveVideoDownloaderFileId, 'invalid-json');
+              return;
+            }
+            handleResponse(xhr.__driveVideoDownloaderFileId, parsed, text);
+          } else {
+            // A 200 with an empty body: nothing parseable came back.
+            postCaptureError(xhr.__driveVideoDownloaderFileId, 'invalid-json');
           }
         } catch (e) {}
+      });
+      xhr.addEventListener('error', function () {
+        postCaptureError(xhr.__driveVideoDownloaderFileId, 'network');
+      });
+      xhr.addEventListener('abort', function () {
+        postCaptureError(xhr.__driveVideoDownloaderFileId, 'aborted');
+      });
+      xhr.addEventListener('timeout', function () {
+        postCaptureError(xhr.__driveVideoDownloaderFileId, 'timeout');
       });
     }
     return origSend.apply(this, arguments);
