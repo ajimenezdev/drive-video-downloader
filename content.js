@@ -12,8 +12,14 @@
 // - Every capture carries the file ID of the video the player requested;
 //   captures for any other file are ignored, including late responses that
 //   arrive after the user already navigated away.
-// - On navigation (history API, back/forward, or any URL change caught by
-//   the fallback poller) the captured URL and the button are discarded.
+// - On navigation the captured URL and the button are discarded. The
+//   MAIN-world hook (hook.js) wraps history.pushState/replaceState and
+//   notifies this script with a 'dvd-navigation' message carrying the
+//   new URL; a popstate listener and a 1 s interval poller are fallbacks
+//   for URL changes that reach us no other way. (The history wrapper
+//   deliberately does NOT live here: patching history from the isolated
+//   world would only shadow this script's own copy and would never see
+//   the page's calls.)
 // - The button is only shown once a URL for the current file arrives, and
 //   the click handler re-checks the file ID at click time, so even a click
 //   racing a navigation cannot open a stale URL.
@@ -44,6 +50,17 @@
     return m ? m[1] : null;
   }
 
+  // File ID carried by a URL string (used for navigation messages, which
+  // bring the new URL with them).
+  function fileIdFromUrl(url) {
+    try {
+      var m = new URL(url).pathname.match(/\/file\/d\/([^/]+)/);
+      return m ? m[1] : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   var lastFileId = currentFileId();
   var captured = null; // { fileId, url } for the current file, or null
   var fallback = null; // { fileId, jsonText } for the current file, or null
@@ -56,9 +73,11 @@
   }
 
   // Called whenever the address bar may have changed. If the file changed,
-  // discard everything captured for the previous one.
-  function onUrlChange() {
-    var now = currentFileId();
+  // discard everything captured for the previous one. When the new URL is
+  // known (navigation message from the hook), use it; otherwise read the
+  // address bar live.
+  function onUrlChange(url) {
+    var now = typeof url === 'string' && url ? fileIdFromUrl(url) : currentFileId();
     if (now === lastFileId) {
       return;
     }
@@ -68,25 +87,12 @@
     hideButton();
   }
 
-  // Detect Drive's SPA navigation: the viewer changes videos through the
-  // History API without reloading. The interval is a fallback for any URL
-  // change that bypasses the History API.
+  // Navigation detection: the primary signal is the 'dvd-navigation'
+  // message from the MAIN-world hook (see the message listener below).
+  // popstate and the interval are fallbacks for URL changes that reach
+  // us no other way.
   (function watchNavigation() {
-    var historyObj = window.history;
-    if (historyObj) {
-      ['pushState', 'replaceState'].forEach(function (method) {
-        var orig = historyObj[method];
-        if (typeof orig !== 'function') {
-          return;
-        }
-        historyObj[method] = function () {
-          var result = orig.apply(this, arguments);
-          onUrlChange();
-          return result;
-        };
-      });
-      window.addEventListener('popstate', onUrlChange);
-    }
+    window.addEventListener('popstate', function () { onUrlChange(); });
     setInterval(onUrlChange, URL_CHECK_MS);
   })();
 
@@ -185,6 +191,15 @@
       return;
     }
     var data = event.data;
+    // Navigation notice from the MAIN-world hook: the page navigated
+    // (history API), with the new URL attached.
+    if (data && typeof data === 'object' && data.source === MESSAGE_SOURCE &&
+        data.type === 'dvd-navigation') {
+      if (typeof data.url === 'string' && data.url) {
+        onUrlChange(data.url);
+      }
+      return;
+    }
     if (!isValidMessage(data)) {
       return;
     }

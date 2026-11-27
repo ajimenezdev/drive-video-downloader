@@ -5,13 +5,19 @@
 // script binds it to the file being viewed, and that navigating between
 // videos never offers a stale URL.
 //
-// Two realms: hook.js runs in a MAIN-world vm context, content.js in an
-// isolated-world vm context. Both share the stubbed window/document/
-// location/history objects — in real Chrome the two worlds have separate
-// JS globals but share the DOM, so the shared stubs are a faithful-enough
-// stand-in for the behaviours under test (message passing, navigation
-// detection, per-file state). postMessage delivery is synchronous here;
-// in the browser it is async, which only changes timing, not ordering.
+// Two genuinely separate worlds: hook.js runs in a MAIN-world vm context,
+// content.js in an isolated-world vm context. Each world has its own
+// window, document, location and history stub objects — as in real Chrome,
+// where the two worlds have separate JS globals. What they share is only
+// what Chrome itself shares: one DOM tree (the document stubs are
+// separate objects over the same element tree) and one address bar (the
+// location stubs are separate objects over the same URL state). The only
+// bridge between the worlds is window.postMessage, delivered from the
+// MAIN window to the isolated world's message listeners, as in the real
+// extension. (Stateless utilities — Blob, timers, console — are shared;
+// each world still gets its own URL and XMLHttpRequest constructors.)
+// postMessage delivery is synchronous here; in the browser it is async,
+// which only changes timing, not ordering.
 //
 // Usage: node test/test-extension.js
 const vm = require('vm');
@@ -64,26 +70,68 @@ function freshCtx(fetchJson) {
     return el;
   }
 
-  const locationStub = {
-    href: fileUrl(FILE_A),
-    pathname: '/file/d/' + FILE_A + '/view',
-    origin: 'https://drive.google.com'
-  };
-  function setLocation(url) {
-    const u = new URL(url);
-    locationStub.href = u.href;
-    locationStub.pathname = u.pathname;
+  // The one shared address-bar state. Both worlds see the same URL (as in
+  // real Chrome, where location is shared), but through separate location
+  // stub objects.
+  const sharedUrl = { href: fileUrl(FILE_A), pathname: '/file/d/' + FILE_A + '/view' };
+  const ORIGIN = 'https://drive.google.com';
+  function setSharedUrl(url) {
+    const u = new URL(url, sharedUrl.href);
+    sharedUrl.href = u.href;
+    sharedUrl.pathname = u.pathname;
+  }
+  function makeLocation() {
+    return {
+      get href() { return sharedUrl.href; },
+      get pathname() { return sharedUrl.pathname; },
+      origin: ORIGIN
+    };
+  }
+  // Separate history objects per world. The MAIN one is the page's router
+  // history (the hook wraps it); the isolated one is a plain stub — the
+  // content script never touches history itself.
+  function makeHistory() {
+    return {
+      pushState(state, title, url) { if (url) { setSharedUrl(url); } },
+      replaceState(state, title, url) { if (url) { setSharedUrl(url); } }
+    };
   }
 
-  const historyStub = {
-    pushState(state, title, url) { if (url) { setLocation(url); } },
-    replaceState(state, title, url) { if (url) { setLocation(url); } }
-  };
+  // One shared DOM tree (as in real Chrome), reached through a separate
+  // document stub object per world.
+  const bodyEl = makeEl('body');
+  const htmlEl = makeEl('html');
+  function makeDocument() {
+    return {
+      createElement(tag) { const el = makeEl(tag); created.push(el); return el; },
+      body: bodyEl,
+      documentElement: htmlEl,
+      getElementById(id) {
+        // Walk the tree from the roots, like the real DOM: removing the box
+        // removes its descendants too.
+        const walk = (el) => {
+          if (el.id === id) { return el; }
+          for (const child of el.children || []) {
+            const found = walk(child);
+            if (found) { return found; }
+          }
+          return null;
+        };
+        return walk(this.body) || walk(this.documentElement);
+      }
+    };
+  }
 
-  const messageListeners = [];
-  const windowStub = {
-    location: locationStub,
-    history: historyStub,
+  // Separate window objects per world. The only bridge is postMessage:
+  // the MAIN window delivers to the isolated world's message listeners
+  // (event.source is the isolated window, as the content script's
+  // `event.source === window` check expects for a same-window message).
+  const isoMessageListeners = [];
+  const mainLocation = makeLocation();
+  const isoLocation = makeLocation();
+  const mainWindow = {
+    location: mainLocation,
+    history: makeHistory(),
     fetch(url) {
       void url;
       return Promise.resolve({
@@ -93,87 +141,107 @@ function freshCtx(fetchJson) {
     },
     open(url) { openedUrls.push(url); return null; },
     postMessage(msg, targetOrigin) {
-      if (targetOrigin !== '*' && targetOrigin !== locationStub.origin) { return; }
-      deliverMessage({ data: msg, origin: locationStub.origin, source: windowStub });
+      if (targetOrigin !== '*' && targetOrigin !== ORIGIN) { return; }
+      isoMessageListeners.slice().forEach(fn => fn.call(isoWindow, { data: msg, origin: ORIGIN, source: isoWindow }));
     },
     addEventListener(type, fn) {
-      if (type === 'message') { messageListeners.push(fn); }
+      (this.__listeners = this.__listeners || {})[type] = ((this.__listeners || {})[type] || []).concat(fn);
+    }
+  };
+  const isoWindow = {
+    location: isoLocation,
+    history: makeHistory(),
+    fetch(url) {
+      void url;
+      return Promise.resolve({
+        clone() { return { json: async () => ctx.fetchJson }; },
+        json: async () => ctx.fetchJson
+      });
+    },
+    open(url) { openedUrls.push(url); return null; },
+    postMessage(msg, targetOrigin) {
+      if (targetOrigin !== '*' && targetOrigin !== ORIGIN) { return; }
+      isoMessageListeners.slice().forEach(fn => fn.call(isoWindow, { data: msg, origin: ORIGIN, source: isoWindow }));
+    },
+    addEventListener(type, fn) {
+      if (type === 'message') { isoMessageListeners.push(fn); }
       else { (this.__listeners = this.__listeners || {})[type] = ((this.__listeners || {})[type] || []).concat(fn); }
     }
   };
   function deliverMessage(event) {
-    messageListeners.slice().forEach(fn => fn.call(windowStub, event));
+    isoMessageListeners.slice().forEach(fn => fn.call(isoWindow, event));
   }
   function dispatchPopState() {
-    const listeners = (windowStub.__listeners || {}).popstate || [];
-    listeners.forEach(fn => fn.call(windowStub, { type: 'popstate' }));
+    const listeners = (isoWindow.__listeners || {}).popstate || [];
+    listeners.forEach(fn => fn.call(isoWindow, { type: 'popstate' }));
   }
 
-  const documentStub = {
-    createElement(tag) { const el = makeEl(tag); created.push(el); return el; },
-    body: makeEl('body'),
-    documentElement: makeEl('html'),
-    getElementById(id) {
-      // Walk the tree from the roots, like the real DOM: removing the box
-      // removes its descendants too.
-      const walk = (el) => {
-        if (el.id === id) { return el; }
-        for (const child of el.children || []) {
-          const found = walk(child);
-          if (found) { return found; }
-        }
-        return null;
-      };
-      return walk(this.body) || walk(this.documentElement);
-    }
-  };
+  const mainDocument = makeDocument();
+  const isoDocument = makeDocument();
 
-  class FakeXHR {
-    constructor() {
-      this.__listeners = {};
-      this.responseText = '';
-      this.response = null;
-      this.responseType = '';
-      this.status = 200;
-    }
-    open(method, url) { this.__url = url; }
-    send() {}
-    addEventListener(type, fn) { (this.__listeners[type] = this.__listeners[type] || []).push(fn); }
-    _load() { (this.__listeners.load || []).forEach(fn => fn.call(this)); }
+  function makeFakeXHR() {
+    return class FakeXHR {
+      constructor() {
+        this.__listeners = {};
+        this.responseText = '';
+        this.response = null;
+        this.responseType = '';
+        this.status = 200;
+      }
+      open(method, url) { this.__url = url; }
+      send() {}
+      addEventListener(type, fn) { (this.__listeners[type] = this.__listeners[type] || []).push(fn); }
+      _load() { (this.__listeners.load || []).forEach(fn => fn.call(this)); }
+    };
   }
 
-  class URLStub extends URL {
-    static createObjectURL(blob) { blobUrls.push(blob); return 'blob:test-' + blobUrls.length; }
-    static revokeObjectURL() {}
+  function makeURLStub() {
+    return class URLStub extends URL {
+      static createObjectURL(blob) { blobUrls.push(blob); return 'blob:test-' + blobUrls.length; }
+      static revokeObjectURL() {}
+    };
   }
 
   const ctx = {
     fetchJson,
-    created, openedUrls, blobUrls, locationStub, historyStub, windowStub,
-    documentStub, deliverMessage, dispatchPopState, setLocation,
+    created, openedUrls, blobUrls,
+    mainWindow, isoWindow, mainLocation, isoLocation,
+    mainDocument, isoDocument,
+    deliverMessage, dispatchPopState,
+    setLocation(url) { setSharedUrl(url); },
     setFetchJson(json) { ctx.fetchJson = json; },
-    // Drive navigates to another file via the History API.
-    navigate(fileId) { windowStub.history.pushState({}, '', fileUrl(fileId)); },
-    navigateTo(url) { windowStub.history.pushState({}, '', url); },
-    button() { return documentStub.getElementById('drive-video-downloader-btn'); },
-    box() { return documentStub.getElementById('drive-video-downloader-box'); }
+    // Drive navigates to another file via the History API — the page's
+    // router calls MAIN-world history, which the hook wraps.
+    navigate(fileId) { mainWindow.history.pushState({}, '', fileUrl(fileId)); },
+    navigateTo(url) { mainWindow.history.pushState({}, '', url); },
+    button() { return isoDocument.getElementById('drive-video-downloader-btn'); },
+    box() { return isoDocument.getElementById('drive-video-downloader-box'); }
   };
 
-  const shared = {
-    window: windowStub,
-    document: documentStub,
-    XMLHttpRequest: FakeXHR,
+  const mainSandbox = {
+    window: mainWindow,
+    document: mainDocument,
+    XMLHttpRequest: makeFakeXHR(),
     Blob: globalThis.Blob,
-    URL: URLStub,
+    URL: makeURLStub(),
     setTimeout,
     setInterval,
     clearInterval,
     console
   };
-  // MAIN world (hook.js) and isolated world (content.js) get separate
-  // vm globals, as in Chrome; they share the stubbed window/document.
-  ctx.mainSandbox = Object.assign({}, shared);
-  ctx.isoSandbox = Object.assign({}, shared);
+  const isoSandbox = {
+    window: isoWindow,
+    document: isoDocument,
+    XMLHttpRequest: makeFakeXHR(),
+    Blob: globalThis.Blob,
+    URL: makeURLStub(),
+    setTimeout,
+    setInterval,
+    clearInterval,
+    console
+  };
+  ctx.mainSandbox = mainSandbox;
+  ctx.isoSandbox = isoSandbox;
   vm.runInNewContext(contentCode, ctx.isoSandbox);
   vm.runInNewContext(hookCode, ctx.mainSandbox);
   return ctx;
@@ -209,7 +277,7 @@ async function testXHR() {
 
 async function testFetch() {
   const c = freshCtx(fixtureA);
-  await c.windowStub.fetch(playbackUrl(FILE_A));
+  await c.mainWindow.fetch(playbackUrl(FILE_A));
   await tick();
   const btn = c.button();
   check('fetch: the "Download video" button appears', !!btn && btn.textContent.indexOf('Download video') !== -1);
@@ -347,6 +415,32 @@ async function testStaleCaptureIgnored() {
   check('stale capture: after B capture, click opens B only', c.openedUrls.length === 1 && c.openedUrls[0].indexOf('file=B') !== -1, JSON.stringify(c.openedUrls));
 }
 
+async function testLateResponseNoIdInRequestUrl() {
+  const c = freshCtx(fixtureA);
+  // Playback request URL with NO file ID in it (only '/drive/media/' +
+  // 'playback'): the hook must bind the capture to the file on screen
+  // when the request STARTS, not when the response arrives.
+  const noIdUrl = 'https://workspacevideo-pa.clients6.google.com/v1/drive/media/playback?auditContext=forDisplay&key=AIzaSyDEMO';
+  const xhr = new c.mainSandbox.XMLHttpRequest();
+  xhr.open('GET', noIdUrl);
+  xhr.send();
+  // Navigate to B before the response arrives.
+  c.navigate(FILE_B);
+  await tick();
+  check('late no-ID response: no button while on B (before response)', !c.button());
+  xhr.responseText = JSON.stringify(fixtureA);
+  xhr._load();
+  await tick();
+  check('late no-ID response: still no button on B after A response arrives', !c.button());
+  check('late no-ID response: nothing opened, nothing offered for B', c.openedUrls.length === 0 && c.blobUrls.length === 0, JSON.stringify(c.openedUrls));
+  // And B still works normally once its own capture arrives.
+  playViaXHR(c, FILE_B, fixtureB);
+  await tick();
+  const btn = c.button();
+  btn.click();
+  check('late no-ID response: after B capture, click opens B only', c.openedUrls.length === 1 && c.openedUrls[0].indexOf('file=B') !== -1, JSON.stringify(c.openedUrls));
+}
+
 async function testRoundTrip() {
   const c = freshCtx(fixtureA);
   playViaXHR(c, FILE_A, fixtureA);
@@ -376,17 +470,17 @@ async function testForgedMessages() {
     ['non-string jsonText', { source: 'drive-video-downloader-hook', type: 'playback', fileId: FILE_A, url: null, jsonText: 42 }]
   ];
   for (const [label, data] of forged) {
-    c.deliverMessage({ data, origin: c.locationStub.origin, source: c.windowStub });
+    c.deliverMessage({ data, origin: c.isoLocation.origin, source: c.isoWindow });
     await tick();
     check('forged message ignored: ' + label, !c.button() && c.openedUrls.length === 0);
   }
-  c.deliverMessage({ data: good, origin: 'https://evil.example', source: c.windowStub });
+  c.deliverMessage({ data: good, origin: 'https://evil.example', source: c.isoWindow });
   await tick();
   check('forged message ignored: wrong origin', !c.button() && c.openedUrls.length === 0);
-  c.deliverMessage({ data: good, origin: c.locationStub.origin, source: {} });
+  c.deliverMessage({ data: good, origin: c.isoLocation.origin, source: {} });
   await tick();
   check('forged message ignored: wrong source window', !c.button() && c.openedUrls.length === 0);
-  c.deliverMessage({ data: good, origin: c.locationStub.origin, source: c.windowStub });
+  c.deliverMessage({ data: good, origin: c.isoLocation.origin, source: c.isoWindow });
   await tick();
   check('well-formed message for the current file is accepted', !!c.button());
 }
@@ -433,6 +527,7 @@ async function testClickRacingNavigation() {
   await testNavigateToNonVideo();
   await testRepeatedNavigation();
   await testStaleCaptureIgnored();
+  await testLateResponseNoIdInRequestUrl();
   await testRoundTrip();
   await testForgedMessages();
   await testNavigateHome();

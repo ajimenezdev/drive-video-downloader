@@ -25,13 +25,21 @@ one the player makes.
   possible: via the manifest content script (`document_start`) and, as a
   fallback, by `background.js` when the page loads. It has a guard against
   double injection (the Drive viewer is a SPA). It only observes and
-  forwards: it never touches the DOM and never opens anything.
+  forwards: it never touches the DOM and never opens anything. It also
+  wraps `history.pushState`/`replaceState` — in the MAIN world, where the
+  page's own router calls them — and notifies the content script when the
+  viewer navigates to another video. The file ID of a capture is bound
+  when its request starts (from the request URL, or from the address bar
+  at that moment), never when the response arrives, so a late response
+  for a video you already left cannot be attributed to the new one.
 - `content.js` runs in the extension's isolated world and owns the rest: it
   listens for the hook's messages, keeps the captured URL bound to the file
   being viewed, shows the button, and opens the link. When you navigate to
   another video without reloading, the state resets and the button only
   appears again once the new video's link is detected — a previous video's
-  URL is never offered. It validates every message (same window and origin,
+  URL is never offered. Navigation is detected from the hook's
+  notification, with a `popstate` listener and a 1 s poller as fallbacks.
+  It validates every message (same window and origin,
   expected shape, well-formed file ID) and the click re-checks the file ID
   against the address bar, so a click racing a navigation cannot open a
   stale URL.
@@ -82,11 +90,14 @@ extension keeps working.
 - `background.js` — service worker: re-injects the hook and the content
   script when the page loads.
 - `hook.js` — the capture hook (MAIN world): observes the player's
-  requests and forwards the progressive link with its file ID.
+  requests and forwards the progressive link with its file ID, and
+  notifies the content script of SPA navigation.
 - `content.js` — the content script (isolated world): per-video state,
-  navigation detection, message validation, the button, and the single
-  place that opens a captured URL.
-- `test/` — Node tests with a stubbed browser and an anonymized playback
+  navigation handling (hook notification, `popstate`, 1 s poller
+  fallback), message validation, the button, and the single place that
+  opens a captured URL.
+- `test/` — Node tests with a stubbed browser (separate MAIN and isolated
+  worlds, bridged only by `postMessage`) and an anonymized playback
   fixture. Run with `node test/test-extension.js`.
 
 ## License

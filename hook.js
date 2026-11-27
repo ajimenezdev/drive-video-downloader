@@ -13,11 +13,18 @@
 //   (itag 18, else 22, else the first one). Quality selection is unchanged
 //   in this PR (a quality picker is planned separately).
 // - It never touches the DOM and never opens anything. The captured URL is
-//   bound to the file the player actually requested: the file ID is taken
-//   from the request URL (/drive/media/<fileId>/playback), falling back to
-//   the address bar when the request URL carries none. That binding is what
-//   lets the content script ignore captures for a video the user already
-//   left (Drive navigates between videos without reloading the page).
+//   bound to the file the player actually requested: the file ID is
+//   captured when the request starts — from the request URL
+//   (/drive/media/<fileId>/playback), or from the address bar at that
+//   moment when the URL carries none — and kept with the request until
+//   its response is processed. The address bar is never read when the
+//   response arrives: by then the viewer may have navigated to another
+//   video and the capture would be misattributed to it.
+// - It also wraps window.history.pushState/replaceState (MAIN world only:
+//   the page's router calls MAIN-world history, so a wrapper anywhere
+//   else would not see its calls) and notifies the content script of
+//   SPA navigation via postMessage. The content script keeps its own
+//   1 s poller as a fallback.
 // - Sends nothing anywhere: everything stays between the browser and Google.
 (function () {
   if (window.__driveVideoDownloaderHookInstalled) {
@@ -27,14 +34,31 @@
 
   var MESSAGE_SOURCE = 'drive-video-downloader-hook';
 
-  // File ID of the video the player requested, from the playback request
-  // URL. Falls back to the address bar when the URL carries no file ID.
-  function fileIdFromRequest(requestUrl) {
+  // File ID from a playback request URL only — no address-bar fallback
+  // here. The fallback is taken once, when the request starts (see
+  // fileIdAtRequestStart), and kept with the request until its response
+  // is processed.
+  function fileIdFromRequestUrl(requestUrl) {
     if (typeof requestUrl === 'string') {
       var m = requestUrl.match(/\/drive\/media\/([^/?#]+)\/playback/);
       if (m) {
         return m[1];
       }
+    }
+    return null;
+  }
+
+  // Capture the file ID when a request starts: from its URL, or from the
+  // address bar at that moment when the URL carries none. The value is
+  // kept with the request (closure for fetch, property for XHR) and used
+  // when the response arrives. Never read the address bar at response
+  // time — by then the viewer may have navigated to another video.
+  // When neither source has an ID, the result is null and the capture
+  // is dropped (it cannot be attributed to any video).
+  function fileIdAtRequestStart(requestUrl) {
+    var fromUrl = fileIdFromRequestUrl(requestUrl);
+    if (fromUrl) {
+      return fromUrl;
     }
     var loc = window.location.pathname.match(/\/file\/d\/([^/]+)/);
     return loc ? loc[1] : null;
@@ -80,10 +104,10 @@
     return found;
   }
 
-  // Forward a capture to the content script. A capture without a file ID
-  // cannot be attributed to a video, so it is dropped.
-  function postCapture(requestUrl, url, jsonText) {
-    var fileId = fileIdFromRequest(requestUrl);
+  // Forward a capture to the content script. The fileId was captured
+  // when the request started; a capture without one cannot be attributed
+  // to a video, so it is dropped.
+  function postCapture(fileId, url, jsonText) {
     if (!fileId) {
       return;
     }
@@ -96,7 +120,7 @@
     }, window.location.origin);
   }
 
-  function handleResponse(requestUrl, json, jsonText) {
+  function handleResponse(fileId, json, jsonText) {
     var video = null;
     try {
       video = pickProgressive(json);
@@ -104,16 +128,52 @@
       video = null;
     }
     if (video) {
-      postCapture(requestUrl, video, null);
+      postCapture(fileId, video, null);
       return;
     }
     // No link: forward the response anyway when it comes from the playback
     // API (it has mediaStreamingData). The content script only offers the
     // JSON fallback when it has no video URL for the current file.
     if (json && json.mediaStreamingData) {
-      postCapture(requestUrl, null, jsonText || JSON.stringify(json));
+      postCapture(fileId, null, jsonText || JSON.stringify(json));
     }
   }
+
+  // Notify the content script that the address bar changed. The new URL
+  // travels in the message so the content script does not have to guess
+  // which file the viewer is on now.
+  function postNavigation() {
+    window.postMessage({
+      source: MESSAGE_SOURCE,
+      type: 'dvd-navigation',
+      url: window.location.href
+    }, window.location.origin);
+  }
+
+  // SPA navigation: Drive changes videos through the History API without
+  // reloading. This wrapper must live in the MAIN world — the page's
+  // router calls MAIN-world history, so a wrapper in the isolated world
+  // would only shadow the content script's own copy and never see the
+  // page's calls. The install guard above keeps the wrapper installed
+  // exactly once even if the hook is injected again.
+  (function watchNavigation() {
+    var historyObj = window.history;
+    if (!historyObj) {
+      return;
+    }
+    ['pushState', 'replaceState'].forEach(function (method) {
+      var orig = historyObj[method];
+      if (typeof orig !== 'function') {
+        return;
+      }
+      historyObj[method] = function () {
+        var result = orig.apply(this, arguments);
+        postNavigation();
+        return result;
+      };
+    });
+    window.addEventListener('popstate', postNavigation);
+  })();
 
   // 1) fetch (in case the player uses it somewhere).
   var origFetch = window.fetch;
@@ -128,10 +188,13 @@
       }
       var p = origFetch.apply(this, arguments);
       if (isPlaybackUrl(url)) {
+        // Bind the file ID now, while the request starts — not when the
+        // response arrives.
+        var fileId = fileIdAtRequestStart(url);
         p.then(function (resp) {
           try {
             resp.clone().json().then(function (j) {
-              handleResponse(url, j, null);
+              handleResponse(fileId, j, null);
             }).catch(function () {});
           } catch (e) {}
         }).catch(function () {});
@@ -146,6 +209,9 @@
   XMLHttpRequest.prototype.open = function (method, url) {
     try {
       this.__driveVideoDownloaderUrl = url;
+      // Bind the file ID when the request is set up — not when its
+      // response arrives.
+      this.__driveVideoDownloaderFileId = fileIdAtRequestStart(url);
     } catch (e) {}
     return origOpen.apply(this, arguments);
   };
@@ -155,12 +221,12 @@
       xhr.addEventListener('load', function () {
         try {
           if (xhr.responseType === 'json' && xhr.response) {
-            handleResponse(xhr.__driveVideoDownloaderUrl, xhr.response, JSON.stringify(xhr.response));
+            handleResponse(xhr.__driveVideoDownloaderFileId, xhr.response, JSON.stringify(xhr.response));
             return;
           }
           var text = xhr.responseText;
           if (text) {
-            handleResponse(xhr.__driveVideoDownloaderUrl, JSON.parse(text), text);
+            handleResponse(xhr.__driveVideoDownloaderFileId, JSON.parse(text), text);
           }
         } catch (e) {}
       });
