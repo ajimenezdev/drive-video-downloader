@@ -29,10 +29,11 @@
 // well-formed fileId plus a string URL (or a string JSON fallback). Note
 // this stops cross-origin forgery, but a script running in the page itself
 // could still forge a same-origin message — that is why the open point
-// below is the only place that opens a URL, and the strict host allowlist
-// for it (googlevideo) is added in the next PR. Until then, the open point
-// only accepts absolute https: URLs, so a forged message can never turn
-// the button into a javascript:/data: opener.
+// below is the only place that opens a URL, and it only opens googlevideo
+// URLs (exact host or a subdomain of googlevideo.com, checked by exact
+// comparison / proper suffix, never substring matching), with
+// noopener/noreferrer. A forged message can therefore never turn the
+// button into an opener for an arbitrary site.
 (function () {
   if (window.__driveVideoDownloaderContentInstalled) {
     return;
@@ -96,20 +97,69 @@
     setInterval(onUrlChange, URL_CHECK_MS);
   })();
 
-  // Single place that opens a captured URL. PR 2 adds the strict allowlist
-  // (googlevideo host) and noopener/noreferrer here; PR 1 only guarantees
-  // the value is an absolute https: URL.
-  function openPlaybackUrl(url) {
+  // Parse a playback URL and allowlist it: absolute URL, exactly https:,
+  // and host googlevideo.com or a subdomain of it. Checked by exact
+  // comparison and a proper '.googlevideo.com' suffix — never includes()
+  // or substring matching, so lookalikes are rejected:
+  // googlevideo.com.evil.com, evilgooglevideo.com, googlevideo.com@evil.com
+  // (the URL parser puts the host after '@', so that one is evil.com).
+  // Returns the parsed URL, or null. Fail closed: anything else opens
+  // nothing and is never offered by the button.
+  function parsePlaybackUrl(url) {
     var parsed = null;
     try {
       parsed = new URL(url);
     } catch (e) {
+      return null;
+    }
+    if (parsed.protocol !== 'https:') {
+      return null;
+    }
+    var host = parsed.hostname;
+    if (host !== 'googlevideo.com' && !host.endsWith('.googlevideo.com')) {
+      return null;
+    }
+    return parsed;
+  }
+
+  // Single place that opens a captured URL. The URL is validated by
+  // parsePlaybackUrl above (https + googlevideo host) and opened with
+  // noopener/noreferrer, so the opened page gets no window.opener and
+  // no referrer.
+  function openPlaybackUrl(url) {
+    var parsed = parsePlaybackUrl(url);
+    if (!parsed) {
       return;
     }
-    if (!parsed || parsed.protocol !== 'https:') {
-      return;
+    window.open(parsed.href, '_blank', 'noopener,noreferrer');
+  }
+
+  // Short, legible error text for a failed capture. The HTTP status is
+  // shown in the button when known (e.g. "Couldn't detect the video
+  // (403)"); the note explains what happened in plain words.
+  function errorButtonText(code) {
+    if (/^[0-9]+$/.test(code)) {
+      return "Couldn't detect the video (" + code + ")";
     }
-    window.open(parsed.href, '_blank');
+    return "Couldn't detect the video";
+  }
+  function errorNoteText(code) {
+    if (/^[0-9]+$/.test(code)) {
+      return 'The player returned an error (' + code + '). Try reloading the page.';
+    }
+    if (code === 'invalid-json') {
+      return 'The player returned an unreadable response. Try reloading the page.';
+    }
+    if (code === 'aborted') {
+      return 'The request was interrupted. Try reloading the page.';
+    }
+    if (code === 'timeout') {
+      return 'The request timed out. Try reloading the page.';
+    }
+    if (code === 'network') {
+      return 'The request failed. Check your connection and try reloading the page.';
+    }
+    return 'The video could not be detected. Try reloading the page.';
   }
 
   function showButton(mode, payload) {
@@ -136,6 +186,7 @@
     var noteEl = document.getElementById('drive-video-downloader-note');
     if (mode === 'video') {
       btnEl.textContent = '⬇ Download video';
+      btnEl.disabled = false;
       noteEl.textContent = 'Click to open the video in a new tab, then download it from the player (⋮ → Download).';
       btnEl.onclick = function () {
         // Re-check at click time: a navigation racing the click must not
@@ -145,8 +196,17 @@
         }
         openPlaybackUrl(captured.url);
       };
+    } else if (mode === 'error') {
+      // A failed capture is visible instead of silent: a disabled button
+      // with the short error state, so nothing is offered and a click
+      // opens nothing.
+      btnEl.textContent = errorButtonText(payload);
+      btnEl.disabled = true;
+      noteEl.textContent = errorNoteText(payload);
+      btnEl.onclick = null;
     } else {
       btnEl.textContent = '⬇ Save response.json';
+      btnEl.disabled = false;
       noteEl.textContent = 'No download link found in the response. Save this file to inspect it.';
       btnEl.onclick = function () {
         if (!fallback || fallback.fileId !== currentFileId()) {
@@ -200,6 +260,19 @@
       }
       return;
     }
+    // Capture error from the MAIN-world hook: the player's request for
+    // this video failed. Show it as a visible error state — but only
+    // when there is nothing better for the current file already (never
+    // downgrade a video link or a JSON fallback we already have).
+    if (data && typeof data === 'object' && data.source === MESSAGE_SOURCE &&
+        data.type === 'dvd-capture-error') {
+      if (typeof data.fileId === 'string' && FILE_ID_PATTERN.test(data.fileId) &&
+          typeof data.code === 'string' && data.code &&
+          data.fileId === currentFileId() && !captured && !fallback) {
+        showButton('error', data.code);
+      }
+      return;
+    }
     if (!isValidMessage(data)) {
       return;
     }
@@ -207,7 +280,10 @@
     if (data.fileId !== currentFileId()) {
       return;
     }
-    if (typeof data.url === 'string' && data.url) {
+    // Only offer URLs that pass the allowlist (https + googlevideo host).
+    // Anything else is rejected here, at receipt, so the button never
+    // offers it; the open point re-checks anyway (defence in depth).
+    if (typeof data.url === 'string' && data.url && parsePlaybackUrl(data.url)) {
       captured = { fileId: data.fileId, url: data.url };
       fallback = null;
       showButton('video', data.url);

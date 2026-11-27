@@ -40,6 +40,8 @@ const fileUrl = (fileId) => 'https://drive.google.com/file/d/' + fileId + '/view
 function freshCtx(fetchJson) {
   const created = [];
   const openedUrls = [];
+  const openedTargets = [];
+  const openedFeatures = [];
   const blobUrls = [];
 
   function makeEl(tag) {
@@ -129,17 +131,39 @@ function freshCtx(fetchJson) {
   const isoMessageListeners = [];
   const mainLocation = makeLocation();
   const isoLocation = makeLocation();
+  // Fetch behaviour the tests can control: HTTP status (ok = 2xx),
+  // a rejected promise (e.g. an AbortError), and a body whose json()
+  // rejects (invalid JSON). Defaults mimic a healthy 200 response.
+  let fetchStatus = 200;
+  let fetchRejectWith = null;
+  let fetchJsonReject = false;
+  function makeFetchStub() {
+    return function (url) {
+      void url;
+      if (fetchRejectWith) { return Promise.reject(fetchRejectWith); }
+      return Promise.resolve({
+        status: fetchStatus,
+        ok: fetchStatus >= 200 && fetchStatus < 300,
+        clone() {
+          return {
+            json: async () => {
+              if (fetchJsonReject) { throw new Error('invalid json'); }
+              return ctx.fetchJson;
+            }
+          };
+        },
+        json: async () => {
+          if (fetchJsonReject) { throw new Error('invalid json'); }
+          return ctx.fetchJson;
+        }
+      });
+    };
+  }
   const mainWindow = {
     location: mainLocation,
     history: makeHistory(),
-    fetch(url) {
-      void url;
-      return Promise.resolve({
-        clone() { return { json: async () => ctx.fetchJson }; },
-        json: async () => ctx.fetchJson
-      });
-    },
-    open(url) { openedUrls.push(url); return null; },
+    fetch: makeFetchStub(),
+    open(url, target, features) { openedUrls.push(url); openedTargets.push(target); openedFeatures.push(features); return null; },
     postMessage(msg, targetOrigin) {
       if (targetOrigin !== '*' && targetOrigin !== ORIGIN) { return; }
       isoMessageListeners.slice().forEach(fn => fn.call(isoWindow, { data: msg, origin: ORIGIN, source: isoWindow }));
@@ -151,14 +175,8 @@ function freshCtx(fetchJson) {
   const isoWindow = {
     location: isoLocation,
     history: makeHistory(),
-    fetch(url) {
-      void url;
-      return Promise.resolve({
-        clone() { return { json: async () => ctx.fetchJson }; },
-        json: async () => ctx.fetchJson
-      });
-    },
-    open(url) { openedUrls.push(url); return null; },
+    fetch: makeFetchStub(),
+    open(url, target, features) { openedUrls.push(url); openedTargets.push(target); openedFeatures.push(features); return null; },
     postMessage(msg, targetOrigin) {
       if (targetOrigin !== '*' && targetOrigin !== ORIGIN) { return; }
       isoMessageListeners.slice().forEach(fn => fn.call(isoWindow, { data: msg, origin: ORIGIN, source: isoWindow }));
@@ -183,15 +201,27 @@ function freshCtx(fetchJson) {
     return class FakeXHR {
       constructor() {
         this.__listeners = {};
-        this.responseText = '';
+        this._responseText = '';
         this.response = null;
         this.responseType = '';
         this.status = 200;
       }
+      // Like a real browser, responseText cannot be read when
+      // responseType is 'json' (it throws InvalidStateError).
+      get responseText() {
+        if (this.responseType === 'json') {
+          throw new Error("Failed to read the 'responseText' property from 'XMLHttpRequest': The value is only accessible if the object's 'responseType' is '' or 'text' (was 'json').");
+        }
+        return this._responseText;
+      }
+      set responseText(v) { this._responseText = v; }
       open(method, url) { this.__url = url; }
       send() {}
       addEventListener(type, fn) { (this.__listeners[type] = this.__listeners[type] || []).push(fn); }
       _load() { (this.__listeners.load || []).forEach(fn => fn.call(this)); }
+      _error() { (this.__listeners.error || []).forEach(fn => fn.call(this)); }
+      _abort() { (this.__listeners.abort || []).forEach(fn => fn.call(this)); }
+      _timeout() { (this.__listeners.timeout || []).forEach(fn => fn.call(this)); }
     };
   }
 
@@ -204,12 +234,15 @@ function freshCtx(fetchJson) {
 
   const ctx = {
     fetchJson,
-    created, openedUrls, blobUrls,
+    created, openedUrls, openedTargets, openedFeatures, blobUrls,
     mainWindow, isoWindow, mainLocation, isoLocation,
     mainDocument, isoDocument,
     deliverMessage, dispatchPopState,
     setLocation(url) { setSharedUrl(url); },
     setFetchJson(json) { ctx.fetchJson = json; },
+    setFetchStatus(status) { fetchStatus = status; },
+    setFetchReject(err) { fetchRejectWith = err; },
+    setFetchJsonReject(flag) { fetchJsonReject = flag; },
     // Drive navigates to another file via the History API — the page's
     // router calls MAIN-world history, which the hook wraps.
     navigate(fileId) { mainWindow.history.pushState({}, '', fileUrl(fileId)); },
@@ -460,7 +493,7 @@ async function testRoundTrip() {
 
 async function testForgedMessages() {
   const c = freshCtx(fixtureA);
-  const good = { source: 'drive-video-downloader-hook', type: 'playback', fileId: FILE_A, url: 'https://example.com/videoplayback?itag=18&file=A', jsonText: null };
+  const good = { source: 'drive-video-downloader-hook', type: 'playback', fileId: FILE_A, url: 'https://rr1---sn-abc123.googlevideo.com/videoplayback?itag=18&file=A', jsonText: null };
   const forged = [
     ['wrong source marker', { source: 'something-else', type: 'playback', fileId: FILE_A, url: good.url, jsonText: null }],
     ['wrong type', { source: 'drive-video-downloader-hook', type: 'other', fileId: FILE_A, url: good.url, jsonText: null }],
@@ -516,6 +549,220 @@ async function testClickRacingNavigation() {
   check('click racing navigation: nothing opens for the previous video', c.openedUrls.length === 0, JSON.stringify(c.openedUrls));
 }
 
+// --- PR 2: strict URL validation and visible capture errors ---
+
+function noteText(c) {
+  const n = c.isoDocument.getElementById('drive-video-downloader-note');
+  return n ? n.textContent : '';
+}
+
+// Click the button if there is one; report whether nothing opened.
+// (Guards against a null button so a failing check reports FAIL
+// instead of crashing the suite with a TypeError.)
+function clickOpensNothing(c) {
+  const b = c.button();
+  if (b) { b.click(); }
+  return c.openedUrls.length === 0;
+}
+
+async function testOpenUrlAllowlist() {
+  const cases = [
+    ['apex googlevideo accepted', 'https://googlevideo.com/videoplayback?itag=18&file=A', true],
+    ['subdomain accepted', 'https://rr1---sn-abc123.googlevideo.com/videoplayback?itag=18&file=A', true],
+    ['uppercase host accepted', 'https://RR1---SN-ABC123.GOOGLEVIDEO.COM/videoplayback?itag=18&file=A', true],
+    ['http rejected', 'http://rr1---sn-abc123.googlevideo.com/videoplayback?itag=18&file=A', false],
+    ['other host rejected', 'https://example.com/videoplayback?itag=18&file=A', false],
+    ['googlevideo.com.evil.com rejected', 'https://googlevideo.com.evil.com/videoplayback?itag=18&file=A', false],
+    ['evilgooglevideo.com rejected', 'https://evilgooglevideo.com/videoplayback?itag=18&file=A', false],
+    ['googlevideo.com@evil.com rejected', 'https://googlevideo.com@evil.com/videoplayback?itag=18&file=A', false],
+    ['javascript: rejected', 'javascript:alert(1)', false],
+    ['data: rejected', 'data:text/html,hello', false],
+    ['drive.google.com rejected', 'https://drive.google.com/file/d/FILE_A_ID/view', false],
+  ];
+  for (const [label, url, allowed] of cases) {
+    const c = freshCtx(fixtureA);
+    c.deliverMessage({ data: { source: 'drive-video-downloader-hook', type: 'playback', fileId: FILE_A, url, jsonText: null }, origin: c.isoLocation.origin, source: c.isoWindow });
+    await tick();
+    if (allowed) {
+      check('allowlist: ' + label, !!c.button() && c.button().textContent.indexOf('Download video') !== -1);
+      c.button().click();
+      check('allowlist: click opens ' + label, c.openedUrls.length === 1 && c.openedUrls[0].indexOf('googlevideo.com') !== -1, JSON.stringify(c.openedUrls));
+      check('allowlist: opens with _blank + noopener,noreferrer (' + label + ')', c.openedTargets[0] === '_blank' && typeof c.openedFeatures[0] === 'string' && c.openedFeatures[0].indexOf('noopener') !== -1 && c.openedFeatures[0].indexOf('noreferrer') !== -1, JSON.stringify(c.openedFeatures));
+    } else {
+      check('allowlist: ' + label, !c.button() && c.openedUrls.length === 0);
+    }
+  }
+}
+
+async function testCaptureErrorsXHR() {
+  for (const status of [403, 404, 500]) {
+    const c = freshCtx(fixtureA);
+    const xhr = new c.mainSandbox.XMLHttpRequest();
+    xhr.open('GET', playbackUrl(FILE_A));
+    xhr.send();
+    xhr.status = status;
+    xhr.responseText = JSON.stringify({ error: { code: status, status: 'ERROR' } });
+    xhr._load();
+    await tick();
+    const btn = c.button();
+    check('XHR error ' + status + ': error state is shown with the code', !!btn && btn.textContent.indexOf("Couldn't detect the video") !== -1 && btn.textContent.indexOf('(' + status + ')') !== -1, btn ? btn.textContent : 'no button');
+    check('XHR error ' + status + ': note names the error', noteText(c).indexOf('(' + status + ')') !== -1, noteText(c));
+    check('XHR error ' + status + ': click opens nothing', clickOpensNothing(c), JSON.stringify(c.openedUrls));
+  }
+
+  const c2 = freshCtx(fixtureA);
+  const xhr2 = new c2.mainSandbox.XMLHttpRequest();
+  xhr2.open('GET', playbackUrl(FILE_A));
+  xhr2.send();
+  xhr2.status = 200;
+  xhr2.responseText = 'this is not json {';
+  xhr2._load();
+  await tick();
+  check('XHR invalid JSON: error state is shown', !!c2.button() && c2.button().textContent.indexOf("Couldn't detect the video") !== -1);
+  check('XHR invalid JSON: note says the response is unreadable', noteText(c2).indexOf('unreadable') !== -1, noteText(c2));
+  check('XHR invalid JSON: click opens nothing', clickOpensNothing(c2));
+
+  const c3 = freshCtx(fixtureA);
+  const xhr3 = new c3.mainSandbox.XMLHttpRequest();
+  xhr3.open('GET', playbackUrl(FILE_A));
+  xhr3.send();
+  xhr3._abort();
+  await tick();
+  check('XHR abort: error state is shown', !!c3.button() && c3.button().textContent.indexOf("Couldn't detect the video") !== -1);
+  check('XHR abort: note says the request was interrupted', noteText(c3).indexOf('interrupted') !== -1, noteText(c3));
+  check('XHR abort: click opens nothing', clickOpensNothing(c3));
+
+  const c4 = freshCtx(fixtureA);
+  const xhr4 = new c4.mainSandbox.XMLHttpRequest();
+  xhr4.open('GET', playbackUrl(FILE_A));
+  xhr4.send();
+  xhr4._timeout();
+  await tick();
+  check('XHR timeout: error state is shown', !!c4.button() && c4.button().textContent.indexOf("Couldn't detect the video") !== -1);
+  check('XHR timeout: note says the request timed out', noteText(c4).indexOf('timed out') !== -1, noteText(c4));
+  check('XHR timeout: click opens nothing', clickOpensNothing(c4));
+
+  const c5 = freshCtx(fixtureA);
+  const xhr5 = new c5.mainSandbox.XMLHttpRequest();
+  xhr5.open('GET', playbackUrl(FILE_A));
+  xhr5.send();
+  xhr5._error();
+  await tick();
+  check('XHR network error: error state is shown', !!c5.button() && c5.button().textContent.indexOf("Couldn't detect the video") !== -1);
+  check('XHR network error: note mentions the failed request', noteText(c5).indexOf('failed') !== -1, noteText(c5));
+  check('XHR network error: click opens nothing', clickOpensNothing(c5));
+}
+
+async function testXHRJsonResponseTypeNull() {
+  // Reviewer regression (PR #2): XHR with responseType 'json' and a
+  // null response (empty body). In a real browser responseText cannot
+  // be read with responseType 'json' — it throws — and the old code
+  // fell into the outer catch silently, reporting nothing.
+  const c = freshCtx(fixtureA);
+  const xhr = new c.mainSandbox.XMLHttpRequest();
+  xhr.open('GET', playbackUrl(FILE_A));
+  xhr.send();
+  xhr.status = 200;
+  xhr.responseType = 'json';
+  xhr.response = null;
+  xhr._load();
+  await tick();
+  const btn = c.button();
+  // The button shows the code only for numeric HTTP statuses; for
+  // 'invalid-json' the code travels in the note (same as the existing
+  // invalid-JSON test).
+  check('XHR json responseType + null response: invalid-json error is shown', !!btn && btn.textContent.indexOf("Couldn't detect the video") !== -1, btn ? btn.textContent : 'no button');
+  check('XHR json responseType + null response: note says the response is unreadable', noteText(c).indexOf('unreadable') !== -1, noteText(c));
+  check('XHR json responseType + null response: click opens nothing', clickOpensNothing(c));
+}
+
+async function testCaptureErrorsFetch() {
+  const c = freshCtx(fixtureA);
+  c.setFetchStatus(403);
+  await c.mainWindow.fetch(playbackUrl(FILE_A));
+  await tick();
+  const btn = c.button();
+  check('fetch error 403: error state is shown with the code', !!btn && btn.textContent.indexOf("Couldn't detect the video (403)") !== -1, btn ? btn.textContent : 'no button');
+  check('fetch error 403: click opens nothing', clickOpensNothing(c));
+
+  const c2 = freshCtx(fixtureA);
+  c2.setFetchJsonReject(true);
+  await c2.mainWindow.fetch(playbackUrl(FILE_A));
+  await tick();
+  check('fetch invalid JSON: error state is shown', !!c2.button() && c2.button().textContent.indexOf("Couldn't detect the video") !== -1);
+  check('fetch invalid JSON: note says the response is unreadable', noteText(c2).indexOf('unreadable') !== -1, noteText(c2));
+
+  const c3 = freshCtx(fixtureA);
+  const abortErr = new Error('The operation was aborted');
+  abortErr.name = 'AbortError';
+  c3.setFetchReject(abortErr);
+  // The hook returns the player's own (rejecting) promise, so the caller
+  // sees the rejection too — the test swallows it, as the player would.
+  await c3.mainWindow.fetch(playbackUrl(FILE_A)).catch(() => {});
+  await tick();
+  check('fetch abort: error state is shown', !!c3.button() && c3.button().textContent.indexOf("Couldn't detect the video") !== -1);
+  check('fetch abort: note says the request was interrupted', noteText(c3).indexOf('interrupted') !== -1, noteText(c3));
+}
+
+async function testErrorStateLifecycle() {
+  // Error for a video that is not on screen: ignored.
+  const c = freshCtx(fixtureA);
+  c.deliverMessage({ data: { source: 'drive-video-downloader-hook', type: 'dvd-capture-error', fileId: FILE_B, code: '403' }, origin: c.isoLocation.origin, source: c.isoWindow });
+  await tick();
+  check('error for another file: ignored', !c.button());
+  // Malformed error message: ignored.
+  c.deliverMessage({ data: { source: 'drive-video-downloader-hook', type: 'dvd-capture-error', fileId: FILE_A }, origin: c.isoLocation.origin, source: c.isoWindow });
+  await tick();
+  check('error without a code: ignored', !c.button());
+  c.deliverMessage({ data: { source: 'something-else', type: 'dvd-capture-error', fileId: FILE_A, code: '403' }, origin: c.isoLocation.origin, source: c.isoWindow });
+  await tick();
+  check('error with a wrong source marker: ignored', !c.button());
+
+  // Error, then a successful capture for the same file replaces it.
+  const c2 = freshCtx(fixtureA);
+  const xhr = new c2.mainSandbox.XMLHttpRequest();
+  xhr.open('GET', playbackUrl(FILE_A));
+  xhr.send();
+  xhr.status = 403;
+  xhr.responseText = '{}';
+  xhr._load();
+  await tick();
+  check('error then success: error shown first', !!c2.button() && c2.button().textContent.indexOf("Couldn't detect the video (403)") !== -1);
+  playViaXHR(c2, FILE_A, fixtureA);
+  await tick();
+  const btn2 = c2.button();
+  check('error then success: video button replaces the error', !!btn2 && btn2.textContent.indexOf('Download video') !== -1);
+  btn2.click();
+  check('error then success: click opens the video', c2.openedUrls.length === 1 && c2.openedUrls[0].indexOf('itag=18') !== -1, JSON.stringify(c2.openedUrls));
+
+  // A successful capture, then an error for the same file: no downgrade.
+  const c3 = freshCtx(fixtureA);
+  playViaXHR(c3, FILE_A, fixtureA);
+  await tick();
+  const xhr3 = new c3.mainSandbox.XMLHttpRequest();
+  xhr3.open('GET', playbackUrl(FILE_A));
+  xhr3.send();
+  xhr3.status = 500;
+  xhr3.responseText = '{}';
+  xhr3._load();
+  await tick();
+  check('success then error: video button stays', !!c3.button() && c3.button().textContent.indexOf('Download video') !== -1);
+
+  // Navigation clears the error state.
+  const c4 = freshCtx(fixtureA);
+  const xhr4 = new c4.mainSandbox.XMLHttpRequest();
+  xhr4.open('GET', playbackUrl(FILE_A));
+  xhr4.send();
+  xhr4.status = 404;
+  xhr4.responseText = '{}';
+  xhr4._load();
+  await tick();
+  check('error then navigate: error shown', !!c4.button() && c4.button().textContent.indexOf("Couldn't detect the video (404)") !== -1);
+  c4.navigate(FILE_B);
+  await tick();
+  check('error then navigate: error gone after navigation', !c4.button());
+}
+
 (async () => {
   await testXHR();
   await testFetch();
@@ -533,6 +780,11 @@ async function testClickRacingNavigation() {
   await testNavigateHome();
   await testPollerFallback();
   await testClickRacingNavigation();
+  await testOpenUrlAllowlist();
+  await testCaptureErrorsXHR();
+  await testXHRJsonResponseTypeNull();
+  await testCaptureErrorsFetch();
+  await testErrorStateLifecycle();
   console.log('\nResult: ' + pass + ' passed, ' + fail + ' failed');
   process.exit(fail ? 1 : 0);
 })();
