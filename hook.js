@@ -264,8 +264,17 @@
             postCaptureError(xhr.__driveVideoDownloaderFileId, String(xhr.status));
             return;
           }
-          if (xhr.responseType === 'json' && xhr.response) {
-            handleResponse(xhr.__driveVideoDownloaderFileId, xhr.response, JSON.stringify(xhr.response));
+          if (xhr.responseType === 'json') {
+            if (xhr.response) {
+              handleResponse(xhr.__driveVideoDownloaderFileId, xhr.response, JSON.stringify(xhr.response));
+            } else {
+              // responseType 'json' with a null response (e.g. an empty
+              // body): responseText cannot be read with responseType
+              // 'json' (the browser throws), so report it as unparseable
+              // instead of letting the exception die silently in the
+              // outer catch.
+              postCaptureError(xhr.__driveVideoDownloaderFileId, 'invalid-json');
+            }
             return;
           }
           var text = xhr.responseText;

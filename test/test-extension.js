@@ -201,11 +201,20 @@ function freshCtx(fetchJson) {
     return class FakeXHR {
       constructor() {
         this.__listeners = {};
-        this.responseText = '';
+        this._responseText = '';
         this.response = null;
         this.responseType = '';
         this.status = 200;
       }
+      // Like a real browser, responseText cannot be read when
+      // responseType is 'json' (it throws InvalidStateError).
+      get responseText() {
+        if (this.responseType === 'json') {
+          throw new Error("Failed to read the 'responseText' property from 'XMLHttpRequest': The value is only accessible if the object's 'responseType' is '' or 'text' (was 'json').");
+        }
+        return this._responseText;
+      }
+      set responseText(v) { this._responseText = v; }
       open(method, url) { this.__url = url; }
       send() {}
       addEventListener(type, fn) { (this.__listeners[type] = this.__listeners[type] || []).push(fn); }
@@ -644,6 +653,29 @@ async function testCaptureErrorsXHR() {
   check('XHR network error: click opens nothing', clickOpensNothing(c5));
 }
 
+async function testXHRJsonResponseTypeNull() {
+  // Reviewer regression (PR #2): XHR with responseType 'json' and a
+  // null response (empty body). In a real browser responseText cannot
+  // be read with responseType 'json' — it throws — and the old code
+  // fell into the outer catch silently, reporting nothing.
+  const c = freshCtx(fixtureA);
+  const xhr = new c.mainSandbox.XMLHttpRequest();
+  xhr.open('GET', playbackUrl(FILE_A));
+  xhr.send();
+  xhr.status = 200;
+  xhr.responseType = 'json';
+  xhr.response = null;
+  xhr._load();
+  await tick();
+  const btn = c.button();
+  // The button shows the code only for numeric HTTP statuses; for
+  // 'invalid-json' the code travels in the note (same as the existing
+  // invalid-JSON test).
+  check('XHR json responseType + null response: invalid-json error is shown', !!btn && btn.textContent.indexOf("Couldn't detect the video") !== -1, btn ? btn.textContent : 'no button');
+  check('XHR json responseType + null response: note says the response is unreadable', noteText(c).indexOf('unreadable') !== -1, noteText(c));
+  check('XHR json responseType + null response: click opens nothing', clickOpensNothing(c));
+}
+
 async function testCaptureErrorsFetch() {
   const c = freshCtx(fixtureA);
   c.setFetchStatus(403);
@@ -750,6 +782,7 @@ async function testErrorStateLifecycle() {
   await testClickRacingNavigation();
   await testOpenUrlAllowlist();
   await testCaptureErrorsXHR();
+  await testXHRJsonResponseTypeNull();
   await testCaptureErrorsFetch();
   await testErrorStateLifecycle();
   console.log('\nResult: ' + pass + ' passed, ' + fail + ' failed');
