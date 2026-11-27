@@ -1,20 +1,23 @@
-// hook.js — Drive Video Downloader (MAIN world).
+// hook.js — Drive Video Downloader (MAIN world, capture only).
 //
-// Watches the requests the Drive player itself makes and captures the
-// download link for the video. It does NOT re-issue the request: re-fetching
-// the playback URL from a bookmarklet or the console fails with 403
+// Watches the requests the Drive player itself makes and forwards what it
+// sees to the content script (content.js, isolated world) via
+// window.postMessage. It does NOT re-issue the request: re-fetching the
+// playback URL from a bookmarklet or the console fails with 403
 // PERMISSION_DENIED even while the video is playing in that same session.
 // Here we only read the response the player already receives.
 //
 // - Wraps window.fetch and XMLHttpRequest (the player uses XHR).
-// - When a response comes from the playback API (URL with '/drive/media/'
-//   and 'playback'), reads the body, parses the JSON and extracts the
-//   progressive link (itag 18, else 22, else the first one).
-// - When the link is captured, shows a fixed 'Download video' button; on
-//   click (a user gesture) it opens the link in a new tab, where the video
-//   can be downloaded from the player (⋮ → Download).
-// - If the response has no link, shows a button that downloads the
-//   response as response.json instead.
+// - When a response arrives from the playback API (URL with '/drive/media/'
+//   and 'playback'), parses the JSON and extracts the progressive link
+//   (itag 18, else 22, else the first one). Quality selection is unchanged
+//   in this PR (a quality picker is planned separately).
+// - It never touches the DOM and never opens anything. The captured URL is
+//   bound to the file the player actually requested: the file ID is taken
+//   from the request URL (/drive/media/<fileId>/playback), falling back to
+//   the address bar when the request URL carries none. That binding is what
+//   lets the content script ignore captures for a video the user already
+//   left (Drive navigates between videos without reloading the page).
 // - Sends nothing anywhere: everything stays between the browser and Google.
 (function () {
   if (window.__driveVideoDownloaderHookInstalled) {
@@ -22,7 +25,20 @@
   }
   window.__driveVideoDownloaderHookInstalled = true;
 
-  var capturedUrl = null;
+  var MESSAGE_SOURCE = 'drive-video-downloader-hook';
+
+  // File ID of the video the player requested, from the playback request
+  // URL. Falls back to the address bar when the URL carries no file ID.
+  function fileIdFromRequest(requestUrl) {
+    if (typeof requestUrl === 'string') {
+      var m = requestUrl.match(/\/drive\/media\/([^/?#]+)\/playback/);
+      if (m) {
+        return m[1];
+      }
+    }
+    var loc = window.location.pathname.match(/\/file\/d\/([^/]+)/);
+    return loc ? loc[1] : null;
+  }
 
   function isPlaybackUrl(url) {
     if (typeof url !== 'string') {
@@ -64,51 +80,23 @@
     return found;
   }
 
-  function showButton(mode, payload) {
-    var box = document.getElementById('drive-video-downloader-box');
-    if (!box) {
-      box = document.createElement('div');
-      box.id = 'drive-video-downloader-box';
-      box.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;' +
-        'background:#fff;border:2px solid #1a73e8;border-radius:10px;padding:12px 14px;' +
-        'font-family:sans-serif;font-size:14px;color:#222;' +
-        'box-shadow:0 4px 16px rgba(0,0,0,.3);max-width:320px;';
-      var btn = document.createElement('button');
-      btn.id = 'drive-video-downloader-btn';
-      btn.style.cssText = 'background:#1a73e8;color:#fff;border:0;border-radius:6px;' +
-        'padding:10px 16px;font-size:15px;font-weight:bold;cursor:pointer;width:100%;';
-      var note = document.createElement('div');
-      note.id = 'drive-video-downloader-note';
-      note.style.cssText = 'margin-top:8px;font-size:12px;color:#555;';
-      box.appendChild(btn);
-      box.appendChild(note);
-      (document.body || document.documentElement).appendChild(box);
+  // Forward a capture to the content script. A capture without a file ID
+  // cannot be attributed to a video, so it is dropped.
+  function postCapture(requestUrl, url, jsonText) {
+    var fileId = fileIdFromRequest(requestUrl);
+    if (!fileId) {
+      return;
     }
-    var btnEl = document.getElementById('drive-video-downloader-btn');
-    var noteEl = document.getElementById('drive-video-downloader-note');
-    if (mode === 'video') {
-      btnEl.textContent = '⬇ Download video';
-      noteEl.textContent = 'Click to open the video in a new tab, then download it from the player (⋮ → Download).';
-      btnEl.onclick = function () {
-        window.open(payload, '_blank');
-      };
-    } else {
-      btnEl.textContent = '⬇ Save response.json';
-      noteEl.textContent = 'No download link found in the response. Save this file to inspect it.';
-      btnEl.onclick = function () {
-        var blob = new Blob([payload], { type: 'application/json' });
-        var a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = 'response.json';
-        a.click();
-        setTimeout(function () {
-          URL.revokeObjectURL(a.href);
-        }, 5000);
-      };
-    }
+    window.postMessage({
+      source: MESSAGE_SOURCE,
+      type: 'playback',
+      fileId: fileId,
+      url: url || null,
+      jsonText: jsonText || null
+    }, window.location.origin);
   }
 
-  function handleJson(json, jsonText) {
+  function handleResponse(requestUrl, json, jsonText) {
     var video = null;
     try {
       video = pickProgressive(json);
@@ -116,17 +104,14 @@
       video = null;
     }
     if (video) {
-      capturedUrl = video;
-      showButton('video', video);
+      postCapture(requestUrl, video, null);
       return;
     }
-    // No link: don't downgrade if we already have one. Only offer the JSON
-    // if the response is from the playback API (it has mediaStreamingData).
-    if (capturedUrl) {
-      return;
-    }
+    // No link: forward the response anyway when it comes from the playback
+    // API (it has mediaStreamingData). The content script only offers the
+    // JSON fallback when it has no video URL for the current file.
     if (json && json.mediaStreamingData) {
-      showButton('json', jsonText || JSON.stringify(json));
+      postCapture(requestUrl, null, jsonText || JSON.stringify(json));
     }
   }
 
@@ -146,7 +131,7 @@
         p.then(function (resp) {
           try {
             resp.clone().json().then(function (j) {
-              handleJson(j, null);
+              handleResponse(url, j, null);
             }).catch(function () {});
           } catch (e) {}
         }).catch(function () {});
@@ -170,12 +155,12 @@
       xhr.addEventListener('load', function () {
         try {
           if (xhr.responseType === 'json' && xhr.response) {
-            handleJson(xhr.response, JSON.stringify(xhr.response));
+            handleResponse(xhr.__driveVideoDownloaderUrl, xhr.response, JSON.stringify(xhr.response));
             return;
           }
           var text = xhr.responseText;
           if (text) {
-            handleJson(JSON.parse(text), text);
+            handleResponse(xhr.__driveVideoDownloaderUrl, JSON.parse(text), text);
           }
         } catch (e) {}
       });

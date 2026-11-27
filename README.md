@@ -24,7 +24,17 @@ one the player makes.
   and `XMLHttpRequest`, not isolated copies) and is injected as early as
   possible: via the manifest content script (`document_start`) and, as a
   fallback, by `background.js` when the page loads. It has a guard against
-  double injection (the Drive viewer is a SPA).
+  double injection (the Drive viewer is a SPA). It only observes and
+  forwards: it never touches the DOM and never opens anything.
+- `content.js` runs in the extension's isolated world and owns the rest: it
+  listens for the hook's messages, keeps the captured URL bound to the file
+  being viewed, shows the button, and opens the link. When you navigate to
+  another video without reloading, the state resets and the button only
+  appears again once the new video's link is detected — a previous video's
+  URL is never offered. It validates every message (same window and origin,
+  expected shape, well-formed file ID) and the click re-checks the file ID
+  against the address bar, so a click racing a navigation cannot open a
+  stale URL.
 - When a response arrives from the playback API (URL containing
   `/drive/media/` and `playback`), it extracts the progressive link: itag 18
   (360p with audio), else 22 (720p), else the first progressive transcode,
@@ -69,8 +79,13 @@ extension keeps working.
 
 - `manifest.json` — MV3, `scripting` permission and
   `https://drive.google.com/*` host permission.
-- `background.js` — service worker: re-injects the hook when the page loads.
-- `hook.js` — the hook (MAIN world) and the download button.
+- `background.js` — service worker: re-injects the hook and the content
+  script when the page loads.
+- `hook.js` — the capture hook (MAIN world): observes the player's
+  requests and forwards the progressive link with its file ID.
+- `content.js` — the content script (isolated world): per-video state,
+  navigation detection, message validation, the button, and the single
+  place that opens a captured URL.
 - `test/` — Node tests with a stubbed browser and an anonymized playback
   fixture. Run with `node test/test-extension.js`.
 
